@@ -13,7 +13,6 @@ from .qlinear import QLinear
 from .quantizer import Quantizer
 from .quant_args import QuantizationOrder
 from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision
-from .accumulate_hessian import accumulate_hessian
 from ..transforms.transforms import build_transform, get_transform_matrix
 from ..utils.linalg_utils import inv_sym
 from ..utils.common_utils import clear_device_cache, to, maybe_first_element
@@ -98,7 +97,8 @@ class GPTQ:
         alpha = 2.0 / (self.num_samples + batch_size)
         self.H.mul_(beta)
         input.mul_(math.sqrt(alpha))
-        accumulate_hessian(self.H, input)
+        # Accumulate the FP32 Gram matrix with PyTorch as in MR-GPTQ.
+        self.H.addmm_(input.T, input)
         self.num_samples += batch_size
 
     def reset(self) -> None:
