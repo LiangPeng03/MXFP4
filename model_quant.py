@@ -284,6 +284,10 @@ def parse_args():
     parser.add_argument("--limit", type=positive_int, help="Cap examples per downstream task for smoke tests.")
     # LM eval params
     parser.add_argument(
+        "--lm_eval_seed", type=int,
+        help="Seed Python, NumPy, Torch and few-shot sampling. Defaults to the lm-eval protocol.",
+    )
+    parser.add_argument(
         "--lm_eval_batch_size",
         type=auto_or_int,
         default="auto",
@@ -437,7 +441,7 @@ def main():
 
     if args.eval_openllm:
         summary["results"] = evaluate_downstream(
-            model, tokenizer, args.lm_eval_tasks, args.lm_eval_batch_size, args.limit
+            model, tokenizer, args.lm_eval_tasks, args.lm_eval_batch_size, args.limit, seed=args.lm_eval_seed
         )
         if args.log_wandb:
             wandb.log({"eval/openllm": summary["results"]})

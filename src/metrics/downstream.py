@@ -46,11 +46,17 @@ def check_downstream_setup(tasks):
         raise RuntimeError("Downstream evaluation requires lm-eval[hf]==0.4.11 and its dependencies.") from exc
 
 
-def evaluate_downstream(model, tokenizer, tasks, batch_size, limit):
+def evaluate_downstream(model, tokenizer, tasks, batch_size, limit, *, seed=None):
     import lm_eval
     from lm_eval.models.huggingface import HFLM
     from lm_eval.utils import make_table
 
+    seed_kwargs = {} if seed is None else {
+        "random_seed": seed,
+        "numpy_random_seed": seed,
+        "torch_random_seed": seed,
+        "fewshot_random_seed": seed,
+    }
     summary = {}
     original_context = model.config.max_position_embeddings
     original_cache = model.config.use_cache
@@ -78,6 +84,7 @@ def evaluate_downstream(model, tokenizer, tasks, batch_size, limit):
                 apply_chat_template=task.chat,
                 confirm_run_unsafe_code=(task_name == "mbpp"),
                 log_samples=False,
+                **seed_kwargs,
             )
             column = "groups" if task_name in evaluation.get("groups", {}) else "results"
             print(make_table(evaluation, column))
