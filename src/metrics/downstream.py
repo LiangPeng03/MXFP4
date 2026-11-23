@@ -51,7 +51,6 @@ def evaluate_downstream(model, tokenizer, tasks, batch_size, limit):
     from lm_eval.models.huggingface import HFLM
     from lm_eval.utils import make_table
 
-    task_manager = lm_eval.tasks.TaskManager()
     summary = {}
     original_context = model.config.max_position_embeddings
     original_cache = model.config.use_cache
@@ -76,7 +75,6 @@ def evaluate_downstream(model, tokenizer, tasks, batch_size, limit):
                 tasks=[task_name],
                 num_fewshot=task.fewshot,
                 limit=task_limit,
-                task_manager=task_manager,
                 apply_chat_template=task.chat,
                 confirm_run_unsafe_code=(task_name == "mbpp"),
                 log_samples=False,
