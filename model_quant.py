@@ -7,20 +7,15 @@ from functools import partial
 import torch
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
-try:
-    import lm_eval
-    from lm_eval.models.huggingface import HFLM
-    from lm_eval.utils import make_table
-except ImportError:
-    lm_eval = None
-    make_table = None
 
+from src.metrics.downstream import MR_GPTQ_TASKS, TASKS, check_downstream_setup, evaluate_downstream
 from src.metrics.perplexity import compute_perplexity
 from src.transforms.transforms import TRANSFORMS
 from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
+from src.quantization.quant_args import ScalePrecision
 from src.quantization.qconfig import prepare_quantization_config
 from src.quantization import rtn_quantization, gptq_quantization
-from src.utils.common_utils import fix_seed
+from src.utils.common_utils import clear_device_cache, fix_seed
 from src.utils.data_utils import get_data, get_wikitext2, get_c4_eval
 
 try:
@@ -33,13 +28,18 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = False
 
 
-def auto_or_int(value):
-    if value == "auto":
-        return value
+def positive_int(value):
     try:
-        return int(value)
+        number = int(value)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"Must be 'auto' or an integer, got '{value}'")
+        raise argparse.ArgumentTypeError(f"Expected a positive integer, got '{value}'") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"Expected a positive integer, got '{value}'")
+    return number
+
+
+def auto_or_int(value):
+    return value if value == "auto" else positive_int(value)
 
 
 def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args):
@@ -279,20 +279,22 @@ def parse_args():
     parser.add_argument("--fuse_global_scale", action="store_true", help="whether to fuse global scale in qkv and gate_up.")
     # Eval params
     parser.add_argument("--eval_perplexity", action="store_true", help="whether to eval perplexity after quantization.")
-    parser.add_argument("--eval_openllm", action="store_true", help="whether to eval OpenLLM v1 openllm after quantization.")
+    parser.add_argument("--eval_openllm", action="store_true", help="Run the MR-GPTQ downstream task suite after quantization.")
+    parser.add_argument("--ppl_limit", type=positive_int, help="Cap the number of PPL windows per dataset for smoke tests.")
+    parser.add_argument("--limit", type=positive_int, help="Cap examples per downstream task for smoke tests.")
     # LM eval params
     parser.add_argument(
         "--lm_eval_batch_size",
         type=auto_or_int,
         default="auto",
-        help="LM eval batch size to evaluate after quantization.",
+        help="Cap the downstream batch size. 'auto' uses the MR-GPTQ per-task batch sizes.",
     )
     parser.add_argument(
         "--lm_eval_tasks",
         nargs="+",
-        type=str,
-        default=["mmlu_cot_llama", "arc_challenge_llama", "gsm8k_llama", "hellaswag", "winogrande", "truthfulqa"],
-        help="OpenLLMv1 tasks to evaluate after quantization."
+        choices=TASKS,
+        default=list(MR_GPTQ_TASKS),
+        help="Downstream tasks to evaluate. Defaults to the ten MR-GPTQ tasks."
     )
     parser.add_argument(
         "--disable_thinking",
@@ -314,6 +316,8 @@ def parse_args():
     )
     # Parse arguments
     args = parser.parse_args()
+    if args.eval_perplexity and args.sequence_length < 2:
+        parser.error("--eval_perplexity requires --sequence_length >= 2.")
     # Check and fix group_size (if needed)
     if args.format == "nvfp":
         if args.w_group_size != NVFP_GROUPSIZE:
@@ -349,6 +353,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.eval_openllm:
+        check_downstream_setup(args.lm_eval_tasks)
     # Fix seed
     fix_seed(args.seed)
     # Set device
@@ -361,19 +367,22 @@ def main():
         wandb.init(config=args)
     # Model
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path, 
-        torch_dtype=args.dtype, 
-        device_map=None if args.cpu_offload_modules else device,
+        args.model_name_or_path,
+        dtype=args.dtype,
         low_cpu_mem_usage=True,
-        attn_implementation="eager",
+        attn_implementation="sdpa" if args.eval_perplexity or args.eval_openllm else "eager",
     )
+    if not args.cpu_offload_modules:
+        model = model.to(device)
     model.config.use_cache = False
     model.requires_grad_(False)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
-    # Sanity check
+    # Only the optional chat variants need a chat template.
     if args.eval_openllm:
-        assert hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None, "OpenLLM v1 works only with chat template."
+        chat_tasks = [task for task in args.lm_eval_tasks if TASKS[task].chat]
+        if chat_tasks and not getattr(tokenizer, "chat_template", None):
+            raise ValueError(f"{', '.join(chat_tasks)} require a tokenizer chat template.")
         if args.disable_thinking:
             if model.config.model_type == "qwen3":
                 tokenizer.apply_chat_template = partial(
@@ -385,108 +394,56 @@ def main():
 
     quantize_anything = args.w_bits < 16 or args.a_bits < 16
 
-    # Prepare calibration data
-    calibration_data = get_data(
-        args.dataset_name_or_path,
-        tokenizer,
-        args.sequence_length,
-        args.num_sequences,
-        args.seed
-    )
-
     if quantize_anything:
+        # MXFP RTN uses per-group scales and does not consume calibration data.
+        calibration_data = []
+        if args.gptq or args.scale_precision == ScalePrecision.E4M3:
+            calibration_data = get_data(
+                args.dataset_name_or_path, tokenizer, args.sequence_length, args.num_sequences, args.seed
+            )
         if args.gptq:
             quantized_state_dict, non_quantized_state_dict = gptq_quantization(model, calibration_data, args, device)
         else:
             quantized_state_dict, non_quantized_state_dict = rtn_quantization(model, calibration_data, args, device)
+        del calibration_data
 
         if args.export_quantized_model:
             export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args) 
             tokenizer.save_pretrained(args.save_path)
 
+    if args.eval_perplexity or args.eval_openllm:
+        model = model.to(device).eval()
+        clear_device_cache(garbage_collection=True)
+
     if args.compile:
         model = torch.compile(model)
 
-    if args.eval_perplexity or args.eval_openllm:
-        model = model.to(device)
-
+    summary = {"model": args.model_name_or_path, "wikitext2_ppl": None, "c4_ppl": None, "results": {}}
     if args.eval_perplexity:
-        eval_data = get_wikitext2(tokenizer, args.sequence_length)
-        ppl = compute_perplexity(model, eval_data)
-        print(f"Wikitext-2 perplexity: {round(ppl, 2):.2f}")
-        if args.log_wandb:
-            wandb.log({"eval/wikitext2_ppl": ppl})
-        
-        c4_data = get_c4_eval(tokenizer, args.sequence_length)
-        c4_ppl = compute_perplexity(model, c4_data)
-        print(f"C4 perplexity: {round(c4_ppl, 2):.2f}")
-        if args.log_wandb:
-            wandb.log({"eval/c4_ppl": c4_ppl})
+        for dataset, label, loader in (
+            ("wikitext2_ppl", "WikiText-2", get_wikitext2),
+            ("c4_ppl", "C4", get_c4_eval),
+        ):
+            eval_data = loader(tokenizer, args.sequence_length)[:args.ppl_limit]
+            if not eval_data:
+                raise ValueError(f"{label} has no complete {args.sequence_length}-token evaluation windows.")
+            ppl = compute_perplexity(model, eval_data)
+            summary[dataset] = ppl
+            print(f"{label} perplexity: {ppl:.4f} ({len(eval_data)} windows)")
+            del eval_data
+            if args.log_wandb:
+                wandb.log({f"eval/{dataset}": ppl})
+        clear_device_cache(garbage_collection=True)
 
-    # OpenLLM v1 openllm (following https://arxiv.org/abs/2411.02355)
     if args.eval_openllm:
-
-        results = {}
-        lm = HFLM(
-            pretrained=model, 
-            tokenizer=tokenizer, 
-            batch_size=args.lm_eval_batch_size,
-            max_length=4096, # from open LLM openllm
+        summary["results"] = evaluate_downstream(
+            model, tokenizer, args.lm_eval_tasks, args.lm_eval_batch_size, args.limit
         )
-        task_manager = lm_eval.tasks.TaskManager()
-
-        # Winogrande (5-shot)
-        if "winogrande" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks="winogrande",
-                num_fewshot=5,
-                batch_size=args.lm_eval_batch_size,
-                task_manager=task_manager,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-        # Hellaswag (10-shot)
-        if "hellaswag" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks="hellaswag",
-                num_fewshot=10,
-                batch_size=args.lm_eval_batch_size,
-                task_manager=task_manager,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-        # GSM8K Llama-3.1
-        if "gsm8k_llama" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks="gsm8k_llama",
-                batch_size=args.lm_eval_batch_size,
-                apply_chat_template=True,
-                fewshot_as_multiturn=True,
-                task_manager=task_manager,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_better": {}}))
-        # MMLU CoT Llama-3.1
-        if "mmlu_cot_llama" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks="mmlu_cot_llama",
-                batch_size=args.lm_eval_batch_size,
-                apply_chat_template=True,
-                fewshot_as_multiturn=True,
-                task_manager=task_manager,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_better": {}}))
-        # Log results
         if args.log_wandb:
-            wandb.log({"eval/openllm": results}) 
-        # Print formatted table
-        print("### Final results ###")
-        print(make_table({"results": results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            wandb.log({"eval/openllm": summary["results"]})
+
+    if args.eval_perplexity or args.eval_openllm:
+        print(f"\n[RESULT_SUMMARY] {json.dumps(summary)}")
 
 
 if __name__ == "__main__":

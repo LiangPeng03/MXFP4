@@ -1,9 +1,61 @@
+import gzip
+import json
 import random
+from itertools import islice
+from pathlib import Path
 from typing import Optional, List
 
 import torch
-from datasets import load_dataset
+from datasets import Dataset, concatenate_datasets, config, load_dataset
 from transformers import AutoTokenizer
+
+
+def load_c4_shard(split):
+    """Read the same first C4 shard used in MR-GPTQ, including older caches."""
+    shard = {
+        "train": "en/c4-train.00000-of-01024.json.gz",
+        "validation": "en/c4-validation.00000-of-00008.json.gz",
+    }[split]
+    revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+    try:
+        return load_dataset("allenai/c4", data_files={split: shard}, split=split)
+    except (ValueError, FileNotFoundError, ConnectionError) as original_error:
+        cache = Path(config.HF_DATASETS_CACHE) / "allenai___c4"
+        candidates = []
+        for info_path in cache.glob("*/*/*/dataset_info.json"):
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            sources = info.get("download_checksums", {})
+            if len(sources) != 1 or not next(iter(sources)).endswith("/" + shard):
+                continue
+            split_info = info.get("splits", {}).get(split)
+            files = sorted(info_path.parent.glob(f"c4-{split}*.arrow"))
+            if split_info and files:
+                candidates.append((info_path, split_info["num_examples"], files))
+
+        if candidates:
+            info_path, expected_rows, files = min(
+                candidates, key=lambda candidate: (candidate[0].parent.name != revision, str(candidate[0]))
+            )
+            parts = [Dataset.from_file(str(file)) for file in files]
+            dataset = concatenate_datasets(parts) if len(parts) > 1 else parts[0]
+            if len(dataset) != expected_rows:
+                raise ValueError(f"Incomplete C4 cache {info_path.parent}: {len(dataset)} rows, expected {expected_rows}")
+            return dataset
+
+        if split == "validation":
+            from huggingface_hub import hf_hub_download
+
+            raw_path = hf_hub_download(
+                repo_id="allenai/c4", repo_type="dataset", filename=shard,
+                revision=revision, local_files_only=True,
+            )
+            with gzip.open(raw_path, "rt", encoding="utf-8") as handle:
+                rows = [{"text": json.loads(line)["text"]} for line in islice(handle, 1100)]
+            if len(rows) != 1100:
+                raise ValueError(f"Incomplete C4 validation prefix: {raw_path}")
+            return Dataset.from_list(rows)
+
+        raise FileNotFoundError(f"No verified local Arrow cache for {shard} under {cache}") from original_error
 
 
 # Only for evaluation
@@ -18,17 +70,10 @@ def get_wikitext2(tokenizer: AutoTokenizer,  sequence_length: int):
 
 
 def get_c4_eval(tokenizer: AutoTokenizer,  sequence_length: int):
-    val_datasetraw = load_dataset(
-        'allenai/c4', 
-        data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, 
-        split='validation'
-    )
+    val_datasetraw = load_c4_shard("validation")
     valenc = tokenizer(' '.join(val_datasetraw[:1100]['text']), return_tensors='pt').input_ids
-    valenc = valenc[:, :(256 * sequence_length)]
-    test_loader = []
-    for i in range(256):
-        test_loader.append(valenc[:, i * sequence_length : (i + 1) * sequence_length])
-    return test_loader
+    num_sequences = min(valenc.numel() // sequence_length, 256)
+    return [valenc[:, i * sequence_length : (i + 1) * sequence_length] for i in range(num_sequences)]
 
 
 def get_c4(
@@ -37,11 +82,7 @@ def get_c4(
     num_calibration_samples: Optional[int] = None,
     seed: int = 42
 ):
-    train_datasetraw = load_dataset(
-        'allenai/c4', 
-        data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, 
-        split='train'
-    )
+    train_datasetraw = load_c4_shard("train")
     all_id =[]
     trainloader = []
     for _ in range(num_calibration_samples):

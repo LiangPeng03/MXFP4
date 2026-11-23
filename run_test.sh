@@ -1,23 +1,19 @@
 #!/bin/bash
-export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
+set -euo pipefail
 
-MODEL="HuggingFaceTB/SmolLM2-135M"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
-$HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL} \
-    --format=nvfp \
+exec "${PYTHON_BIN:-python}" "$(dirname "${BASH_SOURCE[0]}")/model_quant.py" \
+    --model_name_or_path="${MODEL:-Qwen/Qwen3-0.6B}" \
+    --format=mxfp \
     --w_bits=4 \
-    --a_bits=16 \
-    --w_group_size=16 \
-    --a_group_size=16 \
+    --a_bits=4 \
     --transform_class=identity \
-    --w_observer=minmax \
-    --quantization_order=default \
-    --hadamard_group_size=128 \
     --dataset_name_or_path=c4 \
-    --num_sequences=16 \
-    --sequence_length=1024 \
+    --sequence_length=2048 \
+    --seed=0 \
     --dtype=bfloat16 \
     --eval_perplexity \
-    --amp
+    --eval_openllm \
+    "$@"

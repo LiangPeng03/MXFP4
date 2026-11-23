@@ -221,10 +221,27 @@ Above:
 
 For evaluation, we provide the following options:
 
-* `--eval_perplexity` - Whether to evaluate perplexity after quantization.
-* `--eval_openllm` - Whether to evaluate OpenLLM v1 openllm after quantization.
-* `--lm_eval_batch_size` - LM eval batch size to evaluate after quantization.
+* `--eval_perplexity` enables WikiText-2 and C4 evaluation using `--sequence_length` for non-overlapping windows.
+* `--eval_openllm` enables the ten-task MR-GPTQ downstream suite. Use `--lm_eval_tasks` to select a subset.
+* `--lm_eval_batch_size` caps the batch size for every downstream task. The default `auto` uses the MR-GPTQ batch size for each task.
+* `--limit` caps downstream examples per task and `--ppl_limit` caps PPL windows per dataset for smoke tests.
 * `--fuse_global_scale` - Whether to fuse global scale in qkv and gate_up projections as required by `vLLM`.
+
+#### MXFP4 W4A4 baseline with the MR-GPTQ evaluation protocol
+
+On a Linux GPU host, use the MR-GPTQ environment with Transformers 5.8.0, Datasets 4.5.0, `lm-eval[hf]==0.4.11`, and Evaluate 0.4.6. The existing quantization code also imports Triton and `fast_hadamard_transform`.
+
+```bash
+# One PPL window per dataset and one example per downstream task or MMLU subject.
+HF_ALLOW_CODE_EVAL=1 bash run_test.sh --ppl_limit 1 --limit 1 --lm_eval_batch_size 1
+
+# Full protocol. MODEL also accepts a local model directory.
+HF_ALLOW_CODE_EVAL=1 MODEL=Qwen/Qwen3-0.6B bash run_test.sh
+```
+
+`run_test.sh` defaults to RTN MXFP4 W4A4 with an identity transform and BF16 pseudo-quantized inference. Set `PYTHON_BIN` to use a specific interpreter. MBPP executes model-generated Python and requires `HF_ALLOW_CODE_EVAL=1` in the evaluation environment.
+
+PPL uses 2,048-token windows from the WikiText-2 raw test split and up to 256 complete windows from the first 1,100 documents of the first C4 English validation shard. Downstream evaluation uses a 2,048-token context and the task-specific few-shot counts and batch sizes in `src/metrics/downstream.py`. HellaSwag and ARC-Easy have a 4,000-example cap, MMLU has a 200-example cap per subject, and the other seven tasks use their full evaluation splits. Each run prints a `[RESULT_SUMMARY]` JSON line with the PPL and downstream scores.
 
 
 We note, however, that the evaluation within quantization script is not optimized and may take several days.

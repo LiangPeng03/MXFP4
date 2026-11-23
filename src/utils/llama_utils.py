@@ -161,7 +161,10 @@ class QuantizedLlamaAttention(nn.Module):
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if past_key_value is None:
+            past_key_value = kwargs.pop("past_key_values", None)
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -206,7 +209,7 @@ class QuantizedLlamaAttention(nn.Module):
         # Rotate attn output
         attn_output = self.o_in_transform(attn_output)
         attn_output = self.o_proj(attn_output, self.o_in_transform)
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
     def fix_parametrization(self):
         # Fix layer parametrizations
